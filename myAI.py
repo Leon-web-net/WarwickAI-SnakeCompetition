@@ -1,6 +1,7 @@
 import random
 from collections import deque
 from snake.logic import GameState, Turn, Snake, Direction
+from jlogic import jAI
 
 """
 Your mission, should you choose to accept it, is to write the most cracked snake AI possible.
@@ -39,14 +40,5 @@ def myAI(state: GameState) -> Turn:
     # =         Your Code Goes Here        =
     # ======================================
 
-    return random.choice(list(Turn))
-
-    # ======================================
-    # =       Try out some examples!       =
-    # ======================================
-
-    # from examples.dumbAI import dumbAI
-    # return dumbAI(state)
-
-    #from examples.smartAI import smartAI
-    #return smartAI(state)
+    
+    return jAI(state)
