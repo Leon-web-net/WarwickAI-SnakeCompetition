@@ -1,129 +1,210 @@
-import random
 from collections import deque
-from snake.logic import GameState, Turn, DIRECTIONS
+from snake.logic import Turn, DIRECTIONS
 
-def manhattan(a, b):
-    return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
-def bfs_path(start, goals, width, height, walls, occupied):
-    """Find shortest path to any goal avoiding obstacles."""
-    queue = deque([(start, [])])
-    visited = {start}
-    while queue:
-        pos, path = queue.popleft()
-        if pos in goals:
-            return path
-        for dx, dy in DIRECTIONS:
-            nx, ny = pos[0] + dx, pos[1] + dy
-            if 0 <= nx < width and 0 <= ny < height:
-                npos = (nx, ny)
-                if npos not in visited and npos not in walls and npos not in occupied:
-                    visited.add(npos)
-                    queue.append((npos, path + [npos]))
-    return None
-
-
-def is_reachable(start, goal, width, height, walls, occupied):
-    """Check if goal is reachable from start."""
-    queue = deque([start])
-    visited = {start}
-    while queue:
-        pos = queue.popleft()
-        if pos == goal:
-            return True
-        for dx, dy in DIRECTIONS:
-            nx, ny = pos[0] + dx, pos[1] + dy
-            npos = (nx, ny)
-            if (
-                0 <= nx < width
-                and 0 <= ny < height
-                and npos not in visited
-                and npos not in walls
-                and npos not in occupied
-            ):
-                visited.add(npos)
-                queue.append(npos)
-    return False
-
-
-def open_space_score(start, width, height, walls, occupied, limit=50):
-    """Count how many free tiles are reachable from start (limited flood fill)."""
-    queue = deque([start])
-    visited = {start}
-    while queue and len(visited) < limit:
-        pos = queue.popleft()
-        for dx, dy in DIRECTIONS:
-            nx, ny = pos[0] + dx, pos[1] + dy
-            npos = (nx, ny)
-            if (
-                0 <= nx < width
-                and 0 <= ny < height
-                and npos not in visited
-                and npos not in walls
-                and npos not in occupied
-            ):
-                visited.add(npos)
-                queue.append(npos)
-    return len(visited)
-
-
-def jAI(state: GameState) -> Turn:
+def jAI(state):
     snake = state.snake
     enemies = [e for e in state.enemies if e.isAlive]
+    width, height = state.width, state.height
     walls = state.walls
     food = state.food
-    width, height = state.width, state.height
 
     body = list(snake.body)
     body_set = set(body)
     all_enemy_bodies = set().union(*(e.body_set for e in enemies))
 
+    # Precompute occupancy once
+    global_blocked = walls | all_enemy_bodies
+
+    def valid(npos, occupied):
+        x, y = npos
+        return (0 <= x < width and 0 <= y < height and
+                npos not in global_blocked and npos not in occupied)
+
+    def fast_bfs_multi(start, goals, occupied):
+        """Single BFS that can serve both pathfinding and reachability checks."""
+        queue = deque([(start, [])])
+        visited = {start}
+        goal_found = None
+        while queue:
+            pos, path = queue.popleft()
+            if pos in goals:
+                goal_found = path
+                break
+            for dx, dy in DIRECTIONS:
+                npos = (pos[0] + dx, pos[1] + dy)
+                if npos not in visited and valid(npos, occupied):
+                    visited.add(npos)
+                    queue.append((npos, path + [npos]))
+        return goal_found, visited
+
+    # Generate all potential next moves
     possible_moves = {t: snake.get_next_head(t) for t in Turn}
 
-    safe_moves = {}
-    for t, head in possible_moves.items():
-        if not (0 <= head[0] < width and 0 <= head[1] < height):
-            continue
-        if head in walls or (head in body[:-1]) or head in all_enemy_bodies:
-            continue
-        safe_moves[t] = head
+    safe_moves = {
+        t: head for t, head in possible_moves.items()
+        if valid(head, body_set - {body[-1]})  # allow moving into tail cell
+    }
 
     if not safe_moves:
         return Turn.STRAIGHT
 
-    # === MAIN IMPROVEMENT ===
-    # Simulate move -> ensure that after moving, head can reach its tail (avoids self-trap)
-    validated_moves = {}
+    # Efficient self-trap prevention: check reachability only once per head
+    validated = {}
+    tail = body[-1]
     for t, new_head in safe_moves.items():
-        new_body = [new_head] + body[:-1]  # simulate movement
-        new_body_set = set(new_body)
-        tail = body[-1]
+        # Simulate only head+tail update, not entire body copy
+        new_body_set = body_set - {tail}
+        new_body_set.add(new_head)
+        # BFS from head to tail to ensure space
+        _, reachable = fast_bfs_multi(new_head, {tail}, new_body_set)
+        if tail in reachable:
+            validated[t] = new_head
 
-        # Check if head can reach tail (i.e., there's an escape path)
-        if is_reachable(new_head, tail, width, height, walls, new_body_set | all_enemy_bodies):
-            validated_moves[t] = new_head
+    if not validated:
+        validated = safe_moves
 
-    # If all moves are invalidated, fallback to any safe
-    if not validated_moves:
-        validated_moves = safe_moves
-
-    # === BFS to nearest food ===
+    # Choose best food path via BFS (single source)
     if food:
-        path = bfs_path(snake.head, food, width, height, walls, body_set | all_enemy_bodies)
-        if path and len(path) > 0:
-            target_tile = path[0]
-            for turn, pos in validated_moves.items():
-                if pos == target_tile:
-                    return turn
+        path, _ = fast_bfs_multi(snake.head, food, body_set)
+        if path:
+            next_tile = path[0]
+            for t, pos in validated.items():
+                if pos == next_tile:
+                    return t
 
-    # === Fallback: choose move with largest free space ===
-    best_turn, best_score = None, -1
-    for turn, pos in validated_moves.items():
-        score = open_space_score(pos, width, height, walls, body_set | all_enemy_bodies)
-        if score > best_score:
-            best_turn, best_score = turn, score
+    # Use precomputed visited space for heuristic: maximize open area
+    best_turn = max(validated, key=lambda t: len(
+        fast_bfs_multi(validated[t], set(), body_set | all_enemy_bodies)[1]
+    ))
+    return best_turn
 
-    return best_turn if best_turn else Turn.STRAIGHT
+
+# import random
+# from collections import deque
+# from snake.logic import GameState, Turn, DIRECTIONS
+
+# def manhattan(a, b):
+#     return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+# def bfs_path(start, goals, width, height, walls, occupied):
+#     """Find shortest path to any goal avoiding obstacles."""
+#     queue = deque([(start, [])])
+#     visited = {start}
+#     while queue:
+#         pos, path = queue.popleft()
+#         if pos in goals:
+#             return path
+#         for dx, dy in DIRECTIONS:
+#             nx, ny = pos[0] + dx, pos[1] + dy
+#             if 0 <= nx < width and 0 <= ny < height:
+#                 npos = (nx, ny)
+#                 if npos not in visited and npos not in walls and npos not in occupied:
+#                     visited.add(npos)
+#                     queue.append((npos, path + [npos]))
+#     return None
+
+
+# def is_reachable(start, goal, width, height, walls, occupied):
+#     """Check if goal is reachable from start."""
+#     queue = deque([start])
+#     visited = {start}
+#     while queue:
+#         pos = queue.popleft()
+#         if pos == goal:
+#             return True
+#         for dx, dy in DIRECTIONS:
+#             nx, ny = pos[0] + dx, pos[1] + dy
+#             npos = (nx, ny)
+#             if (
+#                 0 <= nx < width
+#                 and 0 <= ny < height
+#                 and npos not in visited
+#                 and npos not in walls
+#                 and npos not in occupied
+#             ):
+#                 visited.add(npos)
+#                 queue.append(npos)
+#     return False
+
+
+# def open_space_score(start, width, height, walls, occupied, limit=50):
+#     """Count how many free tiles are reachable from start (limited flood fill)."""
+#     queue = deque([start])
+#     visited = {start}
+#     while queue and len(visited) < limit:
+#         pos = queue.popleft()
+#         for dx, dy in DIRECTIONS:
+#             nx, ny = pos[0] + dx, pos[1] + dy
+#             npos = (nx, ny)
+#             if (
+#                 0 <= nx < width
+#                 and 0 <= ny < height
+#                 and npos not in visited
+#                 and npos not in walls
+#                 and npos not in occupied
+#             ):
+#                 visited.add(npos)
+#                 queue.append(npos)
+#     return len(visited)
+
+
+# def jAI(state: GameState) -> Turn:
+#     snake = state.snake
+#     enemies = [e for e in state.enemies if e.isAlive]
+#     walls = state.walls
+#     food = state.food
+#     width, height = state.width, state.height
+
+#     body = list(snake.body)
+#     body_set = set(body)
+#     all_enemy_bodies = set().union(*(e.body_set for e in enemies))
+
+#     possible_moves = {t: snake.get_next_head(t) for t in Turn}
+
+#     safe_moves = {}
+#     for t, head in possible_moves.items():
+#         if not (0 <= head[0] < width and 0 <= head[1] < height):
+#             continue
+#         if head in walls or (head in body[:-1]) or head in all_enemy_bodies:
+#             continue
+#         safe_moves[t] = head
+
+#     if not safe_moves:
+#         return Turn.STRAIGHT
+
+#     # === MAIN IMPROVEMENT ===
+#     # Simulate move -> ensure that after moving, head can reach its tail (avoids self-trap)
+#     validated_moves = {}
+#     for t, new_head in safe_moves.items():
+#         new_body = [new_head] + body[:-1]  # simulate movement
+#         new_body_set = set(new_body)
+#         tail = body[-1]
+
+#         # Check if head can reach tail (i.e., there's an escape path)
+#         if is_reachable(new_head, tail, width, height, walls, new_body_set | all_enemy_bodies):
+#             validated_moves[t] = new_head
+
+#     # If all moves are invalidated, fallback to any safe
+#     if not validated_moves:
+#         validated_moves = safe_moves
+
+#     # === BFS to nearest food ===
+#     if food:
+#         path = bfs_path(snake.head, food, width, height, walls, body_set | all_enemy_bodies)
+#         if path and len(path) > 0:
+#             target_tile = path[0]
+#             for turn, pos in validated_moves.items():
+#                 if pos == target_tile:
+#                     return turn
+
+#     # === Fallback: choose move with largest free space ===
+#     best_turn, best_score = None, -1
+#     for turn, pos in validated_moves.items():
+#         score = open_space_score(pos, width, height, walls, body_set | all_enemy_bodies)
+#         if score > best_score:
+#             best_turn, best_score = turn, score
+
+#     return best_turn if best_turn else Turn.STRAIGHT
 
 
 # import json, os, random
