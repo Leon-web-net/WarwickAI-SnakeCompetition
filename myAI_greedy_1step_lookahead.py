@@ -82,6 +82,10 @@ def myAI(state: GameState) -> Turn:
 
     
     def food_dist(move):
+        """
+        Returns the manhattan distance from the resulting head position
+        to the chosen target food. If no food exists, returns 0.
+        """
         p = next_pos[move]
         return manhattan(p,target) if target is not None else 0
 
