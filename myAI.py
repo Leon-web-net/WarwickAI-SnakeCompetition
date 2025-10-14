@@ -1,6 +1,10 @@
 import random
 from collections import deque
 from snake.logic import GameState, Turn, Snake, Direction
+<<<<<<< HEAD
+=======
+from jlogic import jAI
+>>>>>>> origin/main
 
 """
 Your mission, should you choose to accept it, is to write the most cracked snake AI possible.
@@ -38,6 +42,7 @@ def myAI(state: GameState) -> Turn:
     # ======================================
     # =         Your Code Goes Here        =
     # ======================================
+<<<<<<< HEAD
     def out_of_bounds(p):
         """
         Return True if position p lies outside the grid.
@@ -107,3 +112,8 @@ def myAI(state: GameState) -> Turn:
 
     #from examples.smartAI import smartAI
     #return smartAI(state)
+=======
+
+    
+    return jAI(state)
+>>>>>>> origin/main
