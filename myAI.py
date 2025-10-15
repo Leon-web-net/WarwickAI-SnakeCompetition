@@ -1,10 +1,11 @@
 import random
 from collections import deque
 from snake.logic import GameState, Turn, Snake, Direction
-<<<<<<< HEAD
-=======
+from board_helpers import (
+    manhattan, build_hazard_sets, unsafe, neighbours, passable,
+)
+
 from jlogic import jAI
->>>>>>> origin/main
 
 """
 Your mission, should you choose to accept it, is to write the most cracked snake AI possible.
@@ -14,6 +15,34 @@ All the info you'll need to do this is in the GameState and Snake classes in sna
 Below is all of the data you'll need, and some small examples that you can uncomment and use if you want :)
 
 """
+
+def bfs_path(start,goals,W,H,self_body,enemy_cells,wall_cells):
+    goals = set(goals)
+    q = deque([start]); prev = {start: None}
+    while q:
+        u = q.popleft()
+        if u in goals:
+            path = []
+            while u is not None:
+                path.append(u); u = prev[u]
+            return list(reversed(path))
+        
+        for v in neighbours(u):
+            if v not in prev and passable(v,W,H,self_body,enemy_cells, wall_cells):
+                prev[v] = u; q.append(v)
+    
+    return None
+
+def flood_area(start,W,H,self_body, enemy_cells, wall_cells):
+    if not passable(start,W,H,self_body,enemy_cells,wall_cells): return 0
+    q = deque([start]); seen = {start}
+    while q:
+        u = q.popleft()
+        for v in neighbours(u):
+            if v not in seen and passable(v,W,H, self_body, enemy_cells,wall_cells):
+                seen.add(v); q.append(v)
+    
+    return len(seen)    
 
 
 def myAI(state: GameState) -> Turn:
@@ -42,66 +71,46 @@ def myAI(state: GameState) -> Turn:
     # ======================================
     # =         Your Code Goes Here        =
     # ======================================
-<<<<<<< HEAD
-    def out_of_bounds(p):
-        """
-        Return True if position p lies outside the grid.
-        Args:
-            p: (x,y) integer coordinates.
-        """
-        x, y = p
-        return x < 0 or x >= grid_width or y < 0 or y >= grid_height
 
-    def unsafe(p):
-        """
-        Returns True if moving the head to position p would cause a collision
-        or leave the grid.
-        Collision checked against walls, own body, and all enemy bodies.
-        """
-
-        if out_of_bounds(p):
-            return True
-
-        if p in walls:
-            return True
-        
-        if p in set(my_snake_body):
-            return True
-        
-        if any(p in set(e.body) for e in enemy_snakes):
-            return True
-        
-        return False
-
-    def manhattan(a,b):
-        return abs(a[0]-b[0]) +abs(a[1]-b[1])
-
-
-    head = my_snake_body[0]
-    candidates = [Turn.STRAIGHT, Turn.LEFT, Turn.RIGHT]
-    next_pos   = {Turn.STRAIGHT: straight, Turn.LEFT: left, Turn.RIGHT: right}
-
-    # pick the first safe move; fallback to any move if none safe
-    safe_moves = [t for t in candidates if not unsafe(next_pos[t])]
-    next_move = safe_moves[0] if safe_moves else Turn.STRAIGHT
-
+    self_body, enemy_cells, wall_cells = build_hazard_sets(
+        my_snake_body,enemy_snakes,walls)
     
-    def food_dist(move):
+    next_pos = {
+        Turn.STRAIGHT: straight,
+        Turn.LEFT: left,
+        Turn.RIGHT: right,
+    }
+
+    safe_moves = [t for t,p in next_pos.items() if not unsafe(
+        p,grid_width, grid_height, self_body, enemy_cells,wall_cells
+    )]
+    head = my_snake_body[0]
+    target = min(food, key=lambda f: manhattan(f,head)) if food else None
+
+    # 1) Try BFS path to food on current board
+    if safe_moves and target:
+        path = bfs_path(head,[target], grid_width,grid_height,
+                        self_body,enemy_cells,wall_cells)
+        if path and len(path) >=2:
+            step = path[1] # next cell along the path
+
+            for mv,pos in next_pos.items():
+                if pos == step and mv in safe_moves:
+                    return mv
+    
+    # 2) fallback : maximise space after the move
+    def score(move):
         p = next_pos[move]
-        return manhattan(p,target) if target is not None else 0
-
-    target = min(food, key=lambda f: manhattan(f, head)) if food else None
-
-    next_move = Turn.STRAIGHT
-
+        space = flood_area(p,grid_width,grid_height, self_body, enemy_cells, wall_cells)
+        dist = manhattan(p, target) if target else 0
+        tie =  0 if move is Turn.STRAIGHT else 1
+        return (space, -dist, -(1-tie))
+    
     if safe_moves:
-        best = min(safe_moves, key=lambda t: (food_dist(t),0 if t is Turn.STRAIGHT else 1))
-        next_move = best
-        # next_move = 
-    else:
-        next_move = Turn.STRAIGHT    
+        return max(safe_moves, key=score)
 
-    return next_move
+    return Turn.STRAIGHT
+
 
     # ======================================
     # =       Try out some examples!       =
@@ -112,8 +121,3 @@ def myAI(state: GameState) -> Turn:
 
     #from examples.smartAI import smartAI
     #return smartAI(state)
-=======
-
-    
-    return jAI(state)
->>>>>>> origin/main

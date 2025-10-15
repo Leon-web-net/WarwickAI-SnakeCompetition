@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["snake"]
-py-modules = ["myAI"]
+py-modules = ["myAI","board_helpers"]
 
 [project]
 name = "snake-ai"
