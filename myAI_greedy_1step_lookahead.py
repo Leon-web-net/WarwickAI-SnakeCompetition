@@ -101,7 +101,7 @@ def myAI(state: GameState) -> Turn:
         next_move = Turn.STRAIGHT    
 
     return next_move
-
+    # push
     # ======================================
     # =       Try out some examples!       =
     # ======================================
