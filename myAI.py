@@ -1,172 +1,207 @@
-import os, json, random
-from collections import defaultdict, deque
-from snake.logic import GameState, Turn, Direction
-from board_helpers import neighbours, passable, manhattan
+import os
+import subprocess
+import sys
+from collections import deque
+from typing import Optional
 
-# --- Globals for persistence across ticks and games ---
-ACTIONS = [Turn.LEFT, Turn.STRAIGHT, Turn.RIGHT]
-Q = defaultdict(lambda: [0.0, 0.0, 0.0])   # maps state_tuple -> list of Qs for 3 actions
-prev_state = None
-prev_action = None
-prev_food_dist = None
-prev_score = None
+import numpy as np
+import torch
 
-# Hyperparameters
-ALPHA = 0.2
-GAMMA = 0.98
-EPS_START = 0.10     # start with small exploration to be stable
-EPS_MIN = 0.02
-EPS_DECAY = 0.9995   # decay per step
+from snake.logic import GameState, Turn
+from rl_dqn.models import init_model
+from rl_dqn.utils import state_to_ndarray, load_model_if_exists
+from config import Config
 
-epsilon = EPS_START
-model_path = "q_table.json"
 
-def save_q():
-    with open(model_path, "w") as f:
-        json.dump({str(k): v for k, v in Q.items()}, f)
+# Evaluation-only DQN agent (no training or optimizing)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if DEVICE.type == "cuda":
+    torch.backends.cudnn.benchmark = True
 
-def load_q():
-    if os.path.exists(model_path):
-        with open(model_path) as f:
-            raw = json.load(f)
-        Q.clear()
-        for k, v in raw.items():
-            Q[tuple(eval(k))] = v
+print(f"Device {DEVICE}")
 
-load_q()
+_cfg = Config()
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_model_path = os.path.join(PROJECT_ROOT, _cfg.model_dir, _cfg.model_name)
+print(f"Model path: {_model_path}")
+_policy_net = None
+_target_net = None
+_in_channels: Optional[int] = None
+_expected_in_c: Optional[int] = None  # in-channels expected by loaded weights
 
-# ----- Feature engineering -----
-def danger(pos, state: GameState):
-    """Cell unsafe next turn: wall, body, enemy, hazard."""
-    x, y = pos
-    # Outside grid
-    if not (0 <= x < state.width and 0 <= y < state.height):
-        return 1
-    # Walls
-    if pos in state.walls:
-        return 1
-    # Any snake bodies (yours or enemies)
-    if pos in state.snake.body:
-        return 1
+# For frame stacking on eval to match training input shape
+_obs_history = deque(maxlen=max(0, _cfg.stack_k - 1))
+
+
+def _build_stacked(obs_now: np.ndarray) -> np.ndarray:
+    frames = [obs_now]
+    for past in _obs_history:
+        frames.append(past)
+    while len(frames) < _cfg.stack_k:
+        frames.append(np.zeros_like(obs_now))
+    return np.concatenate(frames[: _cfg.stack_k], axis=0)
+
+
+def _safe_action_mask(state: GameState):
+    snake = state.snake
+    h, w = state.height, state.width
+
+    other_bodies = set()
     for e in state.enemies:
-        if pos in e.body:
-            return 1
-    return 0
+        if getattr(e, "isAlive", True):
+            other_bodies |= set(e.body)
 
-def rel_food_flags(state: GameState):
-    """Food relative to current heading in {left, straight, right}."""
-    head = state.snake.head
-    if not state.food:
-        return (0, 0, 0)
-    # nearest food
-    target = min(state.food, key=lambda f: manhattan(head, f))
-    dir_now = Direction(state.snake.direction)
-    # Map left/straight/right heads
-    left = state.snake.get_next_head(Turn.LEFT)
-    straight = state.snake.get_next_head(Turn.STRAIGHT)
-    right = state.snake.get_next_head(Turn.RIGHT)
-    def closer(next_pos): return 1 if manhattan(next_pos, target) < manhattan(head, target) else 0
-    return (closer(left), closer(straight), closer(right))
+    body_wo_tail = set(list(snake.body)[:-1])
 
-def heading_id(state: GameState):
-    # Encode absolute heading as 0..3 for coarse symmetry breaking
-    # In this engine, snake.direction is an int index 0..3
-    return state.snake.direction
+    def is_safe(turn: Turn) -> bool:
+        nhx, nhy = snake.get_next_head(turn)
+        if nhx < 0 or nhx >= w or nhy < 0 or nhy >= h:
+            return False
+        if (nhx, nhy) in state.walls:
+            return False
+        if (nhx, nhy) in body_wo_tail:
+            return False
+        if (nhx, nhy) in other_bodies:
+            return False
+        return True
 
-def encode_state(state: GameState):
-    """Small, discrete state tuple."""
-    head = state.snake.head
-    left = state.snake.get_next_head(Turn.LEFT)
-    straight = state.snake.get_next_head(Turn.STRAIGHT)
-    right = state.snake.get_next_head(Turn.RIGHT)
+    return [is_safe(Turn.LEFT), is_safe(Turn.STRAIGHT), is_safe(Turn.RIGHT)]
 
-    dL = danger(left, state)
-    dS = danger(straight, state)
-    dR = danger(right, state)
-    fL, fS, fR = rel_food_flags(state)
-    h = heading_id(state)
 
-    return (dL, dS, dR, fL, fS, fR, h)
+def _resolve_model_path() -> str:
+    # Allow override via env var
+    p = os.environ.get("SNAKE_MODEL_PATH")
+    if p and os.path.exists(p):
+        return p
+    # Default from config
+    p = _model_path
+    if os.path.exists(p):
+        return p
+    # Fallback: pick most recent .pt in checkpoints directory
+    ckpt_dir = os.path.join(PROJECT_ROOT, _cfg.model_dir)
+    if os.path.isdir(ckpt_dir):
+        pts = [os.path.join(ckpt_dir, f) for f in os.listdir(ckpt_dir) if f.endswith(".pt")]
+        if pts:
+            pts.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            return pts[0]
+    return p  # may not exist
 
-def food_distance(state: GameState):
-    if not state.food:
-        return None
-    head = state.snake.head
-    return min(manhattan(head, f) for f in state.food)
 
-# ----- Action selection -----
-def select_action(s):
-    global epsilon
-    if random.random() < epsilon:
-        return random.choice(ACTIONS)
-    qs = Q[s]
-    # argmax with random tie-break
-    maxq = max(qs)
-    idxs = [i for i, q in enumerate(qs) if q == maxq]
-    return ACTIONS[random.choice(idxs)]
+def _ensure_model(state: GameState):
+    global _policy_net, _target_net, _in_channels
+    if _policy_net is not None:
+        return
 
-# ----- Reward shaping -----
-def compute_reward(state: GameState, done: bool):
-    # Base step penalty
-    r = -0.1
-    # Food eaten is detectable via score increase or length growth; here use score
-    # Guard for engines without last_events; also detect via score increase
-    events = getattr(state, "last_events", None)
-    if events and ("ate_food" in events):
-        r += 10.0
-    else:
-        # Fallback: reward if score increased since last step
-        global prev_score
-        if prev_score is not None and state.score > prev_score:
-            r += 10.0
-    # Death signal (engine must expose; if not, infer from done flag or head collides)
-    if done:
-        r -= 100.0
-    # Dense shaping: closer to food this step
-    global prev_food_dist
-    cur = food_distance(state)
-    if prev_food_dist is not None and cur is not None:
-        r += 1.0 if cur < prev_food_dist else -1.0
-    return r
+    obs_probe = state_to_ndarray(state)
+    base_c, H, W = obs_probe.shape
+    in_c_default = base_c * _cfg.stack_k
+    _in_channels = in_c_default
 
-# --- Main policy function called by the game each tick ---
+    # Inspect checkpoint to infer expected in_channels if possible
+    model_path = _resolve_model_path()
+    in_c_from_ckpt = None
+    if os.path.exists(model_path):
+        try:
+            obj = torch.load(model_path, map_location="cpu")
+            state_dict = None
+            if isinstance(obj, dict) and "policy" in obj and isinstance(obj["policy"], dict):
+                state_dict = obj["policy"]
+            elif isinstance(obj, dict):
+                state_dict = obj
+            if isinstance(state_dict, dict) and "conv1.weight" in state_dict:
+                shape = state_dict["conv1.weight"].shape  # [32, C, 3, 3]
+                if len(shape) == 4:
+                    in_c_from_ckpt = int(shape[1])
+        except Exception:
+            pass
+
+    chosen_in_c = in_c_from_ckpt or in_c_default
+    _expected_in_c = chosen_in_c
+
+    _policy_net, _target_net = init_model(DEVICE, chosen_in_c, H, W, _cfg.n_actions)
+    # Load weights from checkpoint (full or weights-only)
+    loaded = False
+    if os.path.exists(model_path):
+        try:
+            obj = torch.load(model_path, map_location="cpu")
+            if isinstance(obj, dict) and "policy" in obj and isinstance(obj["policy"], dict):
+                _policy_net.load_state_dict(obj["policy"], strict=False)
+                loaded = True
+            elif isinstance(obj, dict):
+                _policy_net.load_state_dict(obj, strict=False)
+                loaded = True
+        except Exception:
+            loaded = False
+    if not loaded:
+        # As a final attempt, use utility for raw weights
+        try:
+            if load_model_if_exists(model_path, _policy_net):
+                loaded = True
+        except Exception:
+            loaded = False
+    # Basic diagnostics to help verify we're loading what we expect
+    try:
+        print(f"[myAI] Device={DEVICE} | obsC={in_c_default} | ckptC={(in_c_from_ckpt or 'n/a')} | usingC={chosen_in_c}")
+        print(f"[myAI] Checkpoint path: {model_path} | loaded={loaded}")
+    except Exception:
+        pass
+    _target_net.load_state_dict(_policy_net.state_dict())
+
+    _policy_net.eval()
+    _target_net.eval()
+
+
+@torch.no_grad()
+def _greedy_action(obs_tensor: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> int:
+    q = _policy_net(obs_tensor.to(DEVICE))  # type: ignore[arg-type]
+    if valid_mask is not None and valid_mask.dtype == torch.bool and valid_mask.numel() == _cfg.n_actions and valid_mask.any().item():
+        q = q.clone()
+        invalid = (~valid_mask.view(1, -1)).to(q.device)
+        q[invalid] = -1e9
+    return int(torch.argmax(q, dim=1).item())
+
+
 def myAI(state: GameState) -> Turn:
-    """
-    ε-greedy Q-learning policy. Needs the game engine to call with a 'done' or end-of-episode callback.
-    If you lack a done flag, approximate: when snake dies, your AI won't be called again;
-    do a terminal update on the next game's first call using a stored 'terminal_pending' flag.
-    """
-    global prev_state, prev_action, epsilon, prev_food_dist, prev_score
+    _ensure_model(state)
+    obs_now = state_to_ndarray(state)
+    obs_stacked = _build_stacked(obs_now)
+    # Align channels to match the loaded weights if needed
+    if _expected_in_c is not None:
+        c = obs_stacked.shape[0]
+        if c > _expected_in_c:
+            obs_stacked = obs_stacked[:_expected_in_c, :, :]
+        elif c < _expected_in_c:
+            pad = np.zeros((_expected_in_c - c, *obs_stacked.shape[1:]), dtype=obs_stacked.dtype)
+            obs_stacked = np.concatenate([obs_stacked, pad], axis=0)
+    obs_tensor = torch.from_numpy(obs_stacked).unsqueeze(0)
 
-    # Encode current state
-    s = encode_state(state)
+    mask_list = _safe_action_mask(state)
+    mask_tensor = torch.tensor(mask_list, dtype=torch.bool)
 
-    # Choose action
-    a = select_action(s)
+    action_idx = _greedy_action(obs_tensor, mask_tensor)
 
-    # === Learning update for transition (prev_state, prev_action) -> s ===
-    if prev_state is not None and prev_action is not None:
-        # You must supply 'done' and 'last_events' from engine.
-        done = getattr(state, "terminal", False)
-        r = compute_reward(state, done)
+    # Update history for next frame
+    _obs_history.appendleft(obs_now)
 
-        # Q-update
-        a_idx_prev = ACTIONS.index(prev_action)
-        a_idx_next = max(range(3), key=lambda i: Q[s][i])
-        td_target = r + (0.0 if done else GAMMA * Q[s][a_idx_next])
-        Q[prev_state][a_idx_prev] += ALPHA * (td_target - Q[prev_state][a_idx_prev])
+    return [Turn.LEFT, Turn.STRAIGHT, Turn.RIGHT][action_idx]
 
-        # Save sometimes
-        if random.random() < 0.001:
-            save_q()
 
-        # Decay exploration
-        epsilon = max(EPS_MIN, epsilon * EPS_DECAY)
+if __name__ == "__main__":
+    import argparse
 
-    # Book-keeping for next step
-    prev_state = s
-    prev_action = a
-    prev_food_dist = food_distance(state)
-    prev_score = state.score
+    parser = argparse.ArgumentParser(description="Run one evaluation game with DQN")
+    parser.add_argument("--difficulty", type=str, default="medium", help="Difficulty from snake/difficulties.yaml")
+    parser.add_argument("--viz", action="store_true", help="Run with renderer instead of headless test")
+    args = parser.parse_args()
 
-    return a
+    # Force evaluation mode in the child process
+    env = os.environ.copy()
+    env["SNAKE_EVAL"] = "1"
+
+    if args.viz:
+        cmd = [sys.executable, "-m", "snake.snake", "run", args.difficulty]
+    else:
+        # Headless single game
+        cmd = [sys.executable, "-m", "snake.snake", "test", "100", args.difficulty]
+
+    sys.exit(subprocess.call(cmd, env=env))
