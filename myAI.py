@@ -29,6 +29,10 @@ _target_net = None
 _in_channels: Optional[int] = None
 _expected_in_c: Optional[int] = None  # in-channels expected by loaded weights
 
+# Lazy training delegation flag/state
+_SNAKE_TRAIN = (os.environ.get("SNAKE_TRAIN") == "1")
+_delegated_myAI = None
+
 # For frame stacking on eval to match training input shape
 _obs_history = deque(maxlen=max(0, _cfg.stack_k - 1))
 
@@ -162,6 +166,19 @@ def _greedy_action(obs_tensor: torch.Tensor, valid_mask: Optional[torch.Tensor] 
 
 
 def myAI(state: GameState) -> Turn:
+    global _delegated_myAI
+    # Lazily delegate to training implementation to avoid import-time side effects
+    if _SNAKE_TRAIN:
+        if _delegated_myAI is None:
+            try:
+                from myAI_dqn_training import myAI as _training_myAI  # type: ignore
+                _delegated_myAI = _training_myAI
+                print("[myAI] Delegating to training myAI (SNAKE_TRAIN=1)")
+            except Exception as _e:
+                print(f"[myAI] Failed to delegate to training myAI: {_e}")
+                # Fall through to eval mode if delegation fails
+        if _delegated_myAI is not None:
+            return _delegated_myAI(state)
     _ensure_model(state)
     obs_now = state_to_ndarray(state)
     obs_stacked = _build_stacked(obs_now)

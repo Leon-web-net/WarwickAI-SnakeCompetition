@@ -269,10 +269,10 @@ if __name__ == "__main__":
     import argparse, subprocess, sys, os
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--episodes", type=int, default=4000)
-    parser.add_argument("--difficulty", type=str, default="medium")
+    parser.add_argument("--episodes", type=int, default=8000)
+    parser.add_argument("--difficulty", type=str, default="hard")
     # Epsilon overrides and schedule reset
-    parser.add_argument("--eps-start", type=float, default=0.25)
+    parser.add_argument("--eps-start", type=float, default=0.3)
     parser.add_argument("--eps-end", type=float, default=0.1)
     
     parser.add_argument("--eps-decay-steps", type=int)
@@ -285,6 +285,7 @@ if __name__ == "__main__":
     # Ensure training mode in child
     env = os.environ.copy()
     env.pop("SNAKE_EVAL", None)  # force learning
+    env["SNAKE_TRAIN"] = "1"  # delegate myAI to training implementation in child
     # Optional: make saves noisy
     env["DQN_VERBOSE"] = "1"
     # Pass epsilon overrides to child via env
