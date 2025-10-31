@@ -15,8 +15,8 @@ def run(cfg):
         num_food=cfg["num_food"],
     )
 
-    # creates a new snake renderer
-    render = SnakeRenderer(moves_per_second=cfg["moves_per_second"])
+    cell_size = int(50)
+    render = SnakeRenderer( moves_per_second=cfg["moves_per_second"], cell_size=cell_size)
 
     # main loop runs whilst the main window is open
     while render.is_window_open():
