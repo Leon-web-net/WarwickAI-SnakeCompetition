@@ -6,7 +6,6 @@ from typing import Optional
 
 import numpy as np
 import torch
-
 from snake.logic import GameState, Turn
 from rl_dqn.models import init_model
 from rl_dqn.utils import state_to_ndarray, load_model_if_exists
