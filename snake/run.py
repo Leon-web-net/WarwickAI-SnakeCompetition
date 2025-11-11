@@ -4,7 +4,7 @@ from snake.render import SnakeRenderer
 from myAI import myAI
 from examples.smartAI import smartAI as enemyAI
 
-
+# commit test
 def run(cfg):
     # creates a new snake game
     game = SnakeGame(
